@@ -3,18 +3,22 @@ export type Painting = {
   title: string;
   artist: string;
   year: string;
+  period: string;
   style: string;
   museum: string;
+  museumUrl: string;
   image: string; // HD direct
   thumb: string;
   colors: string[];
   description: string;
   aspect: string;
   license: string;
+  sourceUrl: string;
 };
 
-export const paintings: Painting[] = [
-  // — original 20 —
+type CuratedPainting = Omit<Painting, "period" | "museumUrl" | "sourceUrl">;
+
+const curatedPaintings: CuratedPainting[] = [
   {
     id: "starry-night",
     title: "The Starry Night",
@@ -114,20 +118,6 @@ export const paintings: Painting[] = [
     license: "Public domain",
   },
   {
-    id: "guernica",
-    title: "Guernica",
-    artist: "Pablo Picasso",
-    year: "1937",
-    style: "Cubism",
-    museum: "Museo Reina Sofía, Madrid",
-    image: "https://upload.wikimedia.org/wikipedia/en/7/74/PicassoGuernica.jpg",
-    thumb: "https://upload.wikimedia.org/wikipedia/en/7/74/PicassoGuernica.jpg",
-    colors: ["#1a1a1a", "#e8e8e8", "#6a6a6a"],
-    description: "Picasso's powerful anti-war mural responding to the bombing of Guernica.",
-    aspect: "16:9",
-    license: "Public domain in US (fair use)",
-  },
-  {
     id: "scream",
     title: "The Scream",
     artist: "Edvard Munch",
@@ -154,20 +144,6 @@ export const paintings: Painting[] = [
     description: "Rembrandt's dramatic militia company, masterful with light and motion.",
     aspect: "16:10",
     license: "Public domain",
-  },
-  {
-    id: "persistence-memory",
-    title: "The Persistence of Memory",
-    artist: "Salvador Dalí",
-    year: "1931",
-    style: "Surrealism",
-    museum: "MoMA, New York",
-    image: "https://upload.wikimedia.org/wikipedia/en/d/dd/The_Persistence_of_Memory.jpg",
-    thumb: "https://upload.wikimedia.org/wikipedia/en/d/dd/The_Persistence_of_Memory.jpg",
-    colors: ["#c9b896", "#4a6b8a", "#e8d5a3"],
-    description: "Melting clocks in a dreamlike landscape — time and reality warped.",
-    aspect: "4:3",
-    license: "Fair use (still copyrighted in EU)",
   },
   {
     id: "kiss-klimt",
@@ -732,20 +708,6 @@ export const paintings: Painting[] = [
     license: "Public domain",
   },
   {
-    id: "demoiselles",
-    title: "Les Demoiselles d'Avignon",
-    artist: "Pablo Picasso",
-    year: "1907",
-    style: "Cubism",
-    museum: "MoMA, New York",
-    image: "https://upload.wikimedia.org/wikipedia/en/4/4c/Les_Demoiselles_d%27Avignon.jpg",
-    thumb: "https://upload.wikimedia.org/wikipedia/en/4/4c/Les_Demoiselles_d%27Avignon.jpg",
-    colors: ["#c9a86a", "#8a6b5a", "#1a3a4a"],
-    description: "Five fractured nudes — Picasso's break to Cubism.",
-    aspect: "3:4",
-    license: "Public domain in US (fair use)",
-  },
-  {
     id: "starry-over-rhone",
     title: "A Starry Night",
     artist: "Edvard Munch",
@@ -859,6 +821,57 @@ export const paintings: Painting[] = [
   },
 ];
 
+const museumUrls: Record<string, string> = {
+  "Art Institute of Chicago": "https://www.artic.edu/collection",
+  "Belvedere, Vienna": "https://www.belvedere.at/en/collection",
+  "Courtauld Gallery, London": "https://courtauld.ac.uk/gallery/collection/",
+  "Gallerie dell'Accademia, Venice": "https://www.gallerieaccademia.it/en/",
+  "Getty Center, LA": "https://www.getty.edu/art/collection/",
+  "Kröller-Müller Museum": "https://krollermuller.nl/en/collection",
+  "Kunsthalle Hamburg": "https://www.hamburger-kunsthalle.de/en/collection",
+  "Kunsthistorisches Museum, Vienna": "https://www.khm.at/en/objectdb/",
+  "Louvre, Paris": "https://collections.louvre.fr/en/",
+  "Mauritshuis, The Hague": "https://www.mauritshuis.nl/en/our-collection/",
+  "Metropolitan Museum of Art": "https://www.metmuseum.org/art/collection",
+  "MoMA, New York": "https://www.moma.org/collection/",
+  "Munch Museum, Oslo": "https://www.munchmuseet.no/en/the-collection/",
+  "Musée Marmottan Monet, Paris": "https://www.marmottan.fr/en/collections/",
+  "Musée d'Orsay, Paris": "https://www.musee-orsay.fr/en/collections",
+  "National Gallery, London": "https://www.nationalgallery.org.uk/paintings",
+  "National Gallery, Oslo": "https://www.nasjonalmuseet.no/en/collection/",
+  "Philadelphia Museum of Art": "https://www.philamuseum.org/collection",
+  "Phillips Collection, Washington": "https://www.phillipscollection.org/collection",
+  "Prado, Madrid": "https://www.museodelprado.es/en/the-collection",
+  "Rijksmuseum, Amsterdam": "https://www.rijksmuseum.nl/en/collection",
+  "Santa Maria delle Grazie, Milan": "https://cenacolovinciano.org/en/",
+  "Sistine Chapel, Vatican": "https://www.museivaticani.va/content/museivaticani/en/collezioni/musei/cappella-sistina.html",
+  "St Bavo's Cathedral, Ghent": "https://www.sintbaafskathedraal.be/en/",
+  "Uffizi, Florence": "https://www.uffizi.it/en/artworks",
+  "Van Gogh Museum, Amsterdam": "https://www.vangoghmuseum.nl/en/collection",
+  "Vatican Museums": "https://www.museivaticani.va/content/museivaticani/en/collezioni/musei.html",
+  "Wallace Collection, London": "https://www.wallacecollection.org/art/collection/",
+}
+
+function periodFor(year: string): string {
+  const value = Number(year.match(/\d{3,4}/)?.[0])
+  if (!Number.isFinite(value)) return "Unknown period"
+  if (value < 1500) return "Before 1500"
+  if (value < 1600) return "1500s"
+  if (value < 1700) return "1600s"
+  if (value < 1800) return "1700s"
+  if (value < 1900) return "1800s"
+  return "1900s"
+}
+
+/** Curated works use Commons source files; the linked museum collection is attribution context. */
+export const paintings: Painting[] = curatedPaintings.map((painting) => ({
+  ...painting,
+  period: periodFor(painting.year),
+  museumUrl: museumUrls[painting.museum] || "https://commons.wikimedia.org",
+  sourceUrl: painting.image,
+}))
+
 export const artists = [...new Set(paintings.map(p => p.artist))].sort();
 export const styles = [...new Set(paintings.map(p => p.style))].sort();
 export const museums = [...new Set(paintings.map(p => p.museum))].sort();
+export const periods = [...new Set(paintings.map(p => p.period))];

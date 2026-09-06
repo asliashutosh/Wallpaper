@@ -1,39 +1,57 @@
-import { useEffect, useMemo, useState } from "react"
-import { paintings, artists, styles, museums, type Painting } from "./data/paintings"
+import { useEffect, useMemo, useRef, useState } from "react"
+import { paintings, artists, styles, museums, periods, type Painting } from "./data/paintings"
+import { fetchLivePainting, type LiveMode } from "./lib/live"
+import { setNativeWallpaper } from "./lib/native-wallpaper"
+import { getResizedUrl, resolutionOptions, wallpaperFilename, yearSortValue, type Resolution } from "./lib/wallpapers"
 
-type Resolution = "HD (1920×1080)" | "4K (3840×2160)" | "Mobile (1080×1920)" | "Ultrawide (2560×1080)" | "Original"
 type CoverMode = "cover" | "contain"
-type LiveMode = "famous" | "latest" | "random"
+type SortMode = "popular" | "latest" | "random"
+type Palette = "All colors" | "Blue" | "Gold" | "Green" | "Red" | "Monochrome"
+type BeforeInstallPromptEvent = Event & { prompt: () => Promise<void>; userChoice: Promise<{ outcome: "accepted" | "dismissed" }> }
 
-function getResizedUrl(p: Painting, res: Resolution): string {
-  // Wikimedia thumb: /thumb/.../XXXpx-name.jpg -> replace width
-  const targetWidth = res === "4K (3840×2160)" ? "2560px" : res === "HD (1920×1080)" ? "1920px" : res === "Mobile (1080×1920)" ? "1080px" : res === "Ultrawide (2560×1080)" ? "2560px" : null
-  if (targetWidth && p.image.includes("/thumb/")) {
-    return p.image.replace(/\/\d+px-/, `/${targetWidth}-`)
-  }
-  if (targetWidth && p.image.includes("wikimedia.org")) {
-    // fallback for non-thumb original.jpg -> request thumb via ?width (Wikimedia supports thumb proxy, but we keep original)
-    return p.image
-  }
-  // IIIF (Art Institute)
-  if (p.image.includes("/iiif/2/")) {
-    const w = res === "4K (3840×2160)" ? "2000," : res === "HD (1920×1080)" ? "1600," : res === "Mobile (1080×1920)" ? "1080," : res === "Ultrawide (2560×1080)" ? "2560," : "843,"
-    return p.image.replace(/\/full\/[^/]+\//, `/full/${w}/`)
-  }
-  // Met & others: original is already max, return as is
-  return p.image
+const paletteOptions: Palette[] = ["All colors", "Blue", "Gold", "Green", "Red", "Monochrome"]
+
+function hasPalette(colors: string[], palette: Palette) {
+  if (palette === "All colors") return true
+  return colors.some((hex) => {
+    const value = Number.parseInt(hex.slice(1), 16)
+    const red = (value >> 16) & 255
+    const green = (value >> 8) & 255
+    const blue = value & 255
+    const max = Math.max(red, green, blue)
+    const min = Math.min(red, green, blue)
+    const saturation = max === 0 ? 0 : (max - min) / max
+    let hue = 0
+    if (max !== min) {
+      if (max === red) hue = 60 * (((green - blue) / (max - min)) % 6)
+      else if (max === green) hue = 60 * ((blue - red) / (max - min) + 2)
+      else hue = 60 * ((red - green) / (max - min) + 4)
+    }
+    if (hue < 0) hue += 360
+    if (palette === "Monochrome") return saturation < 0.14
+    if (palette === "Blue") return hue >= 185 && hue <= 255 && saturation > 0.2
+    if (palette === "Green") return hue >= 70 && hue <= 175 && saturation > 0.2
+    if (palette === "Gold") return hue >= 32 && hue <= 65 && saturation > 0.25
+    return (hue <= 20 || hue >= 340) && saturation > 0.25
+  })
+}
+
+function safeExternalUrl(value: string): string | undefined {
+  try { return new URL(value).protocol === "https:" ? value : undefined } catch { return undefined }
 }
 
 function App() {
   const [active, setActive] = useState<Painting>(() => {
-    const dayIndex = new Date().getDate() % paintings.length
-    return paintings[dayIndex]
+    return paintings[Math.floor(Date.now() / 86_400_000) % paintings.length]
   })
   const [search, setSearch] = useState("")
   const [artistFilter, setArtistFilter] = useState("All artists")
   const [styleFilter, setStyleFilter] = useState("All styles")
   const [museumFilter, setMuseumFilter] = useState("All museums")
-  const [sort, setSort] = useState<"shuffle" | "artist" | "year">("shuffle")
+  const [periodFilter, setPeriodFilter] = useState("All periods")
+  const [paletteFilter, setPaletteFilter] = useState<Palette>("All colors")
+  const [sort, setSort] = useState<SortMode>("popular")
+  const [randomSeed, setRandomSeed] = useState(() => Date.now())
   const [favs, setFavs] = useState<Set<string>>(() => {
     try { return new Set(JSON.parse(localStorage.getItem("mw_favs") || "[]")) } catch { return new Set() }
   })
@@ -48,17 +66,27 @@ function App() {
   const [toast, setToast] = useState<string | null>(null)
   const [livePainting, setLivePainting] = useState<Painting | null>(null)
   const [liveLoading, setLiveLoading] = useState(false)
-  const [liveMode, setLiveMode] = useState<LiveMode>("famous")
+  const [liveMode, setLiveMode] = useState<LiveMode>("popular")
   const [imgError, setImgError] = useState(false)
   const [autoDaily, setAutoDaily] = useState<boolean>(() => {
     try { return localStorage.getItem("mw_autodaily") === "1" } catch { return false }
   })
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false)
+  const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null)
+  const [visibleCount, setVisibleCount] = useState(16)
+  const moreRef = useRef<HTMLDivElement>(null)
 
-  useEffect(() => { localStorage.setItem("mw_favs", JSON.stringify([...favs])) }, [favs])
-  useEffect(() => { localStorage.setItem("mw_history", JSON.stringify(history.slice(0, 30))) }, [history])
-  useEffect(() => { localStorage.setItem("mw_autodaily", autoDaily ? "1" : "0") }, [autoDaily])
+  useEffect(() => { try { localStorage.setItem("mw_favs", JSON.stringify([...favs])) } catch {} }, [favs])
+  useEffect(() => { try { localStorage.setItem("mw_history", JSON.stringify(history.slice(0, 30))) } catch {} }, [history])
+  useEffect(() => { try { localStorage.setItem("mw_autodaily", autoDaily ? "1" : "0") } catch {} }, [autoDaily])
   useEffect(() => { if (toast) { const t = setTimeout(() => setToast(null), 2400); return () => clearTimeout(t) } }, [toast])
+  useEffect(() => {
+    const onBeforeInstall = (event: Event) => { event.preventDefault(); setInstallPrompt(event as BeforeInstallPromptEvent) }
+    const onInstalled = () => { setInstallPrompt(null); setToast("Masterpiece installed") }
+    window.addEventListener("beforeinstallprompt", onBeforeInstall)
+    window.addEventListener("appinstalled", onInstalled)
+    return () => { window.removeEventListener("beforeinstallprompt", onBeforeInstall); window.removeEventListener("appinstalled", onInstalled) }
+  }, [])
   useEffect(() => { setImgError(false) }, [active.id])
   useEffect(() => {
     // record history on active change
@@ -71,46 +99,55 @@ function App() {
   // daily auto: if enabled, lock to day Index until next day
   useEffect(() => {
     if (!autoDaily) return
-    const dayIndex = new Date().getDate() % paintings.length
-    setActive(paintings[dayIndex])
+    const index = Math.floor(Date.now() / 86_400_000) % paintings.length
+    try { localStorage.setItem("mw_day_index", String(index)) } catch {}
+    setActive(paintings[index])
   }, [autoDaily])
+  useEffect(() => { setVisibleCount(16) }, [search, artistFilter, styleFilter, museumFilter, periodFilter, paletteFilter, showFavsOnly, sort])
 
   const filtered = useMemo(() => {
-    let out = paintings.filter(p => {
+    const catalog = livePainting ? [livePainting, ...paintings] : paintings
+    let out = catalog.filter(p => {
       if (showFavsOnly && !favs.has(p.id)) return false
       if (artistFilter !== "All artists" && p.artist !== artistFilter) return false
       if (styleFilter !== "All styles" && p.style !== styleFilter) return false
       if (museumFilter !== "All museums" && p.museum !== museumFilter) return false
+      if (periodFilter !== "All periods" && p.period !== periodFilter) return false
+      if (!hasPalette(p.colors, paletteFilter)) return false
       if (search) {
         const q = search.toLowerCase()
-        return p.title.toLowerCase().includes(q) || p.artist.toLowerCase().includes(q) || p.style.toLowerCase().includes(q) || p.year.toLowerCase().includes(q) || p.museum.toLowerCase().includes(q)
+        return p.title.toLowerCase().includes(q) || p.artist.toLowerCase().includes(q) || p.style.toLowerCase().includes(q) || p.year.toLowerCase().includes(q) || p.museum.toLowerCase().includes(q) || p.period.toLowerCase().includes(q)
       }
       return true
     })
-    if (sort === "artist") out = [...out].sort((a, b) => a.artist.localeCompare(b.artist))
-    else if (sort === "year") out = [...out].sort((a, b) => a.year.localeCompare(b.year))
-    else if (sort === "shuffle") out = [...out] // keep original
+    if (sort === "latest") out = [...out].sort((a, b) => yearSortValue(b.year) - yearSortValue(a.year))
+    else if (sort === "random") out = [...out].sort((a, b) => {
+      const rank = (value: string) => [...value].reduce((total, char) => (total * 31 + char.charCodeAt(0)) >>> 0, randomSeed)
+      return rank(a.id) - rank(b.id)
+    })
     return out
-  }, [search, artistFilter, styleFilter, museumFilter, favs, showFavsOnly, sort])
+  }, [search, artistFilter, styleFilter, museumFilter, periodFilter, paletteFilter, favs, showFavsOnly, sort, randomSeed, livePainting])
 
   const historyPaintings = useMemo(() => history.map(id => paintings.find(p => p.id === id) || (livePainting?.id === id ? livePainting : null)).filter(Boolean) as Painting[], [history, livePainting])
+  const visiblePaintings = filtered.slice(0, visibleCount)
+  useEffect(() => {
+    const target = moreRef.current
+    if (!target || visibleCount >= filtered.length) return
+    const observer = new IntersectionObserver((entries) => {
+      if (entries[0]?.isIntersecting) setVisibleCount(count => Math.min(count + 16, filtered.length))
+    }, { rootMargin: "480px" })
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [filtered.length, visibleCount])
 
   const randomize = () => {
     const pool = filtered.length > 1 ? filtered.filter(p => p.id !== active.id) : paintings.filter(p => p.id !== active.id)
     const next = pool[Math.floor(Math.random() * pool.length)]
+    if (!next) return
     setActive(next)
     setImgError(false)
     window.scrollTo({ top: 0, behavior: "smooth" })
   }
-
-  const preloadImage = (url: string, timeoutMs = 6000) =>
-    new Promise<void>((resolve, reject) => {
-      const img = new Image()
-      const t = setTimeout(() => reject(new Error("timeout")), timeoutMs)
-      img.onload = () => { clearTimeout(t); resolve() }
-      img.onerror = () => { clearTimeout(t); reject(new Error("load failed")) }
-      img.src = url
-    })
 
   const toggleFav = (id: string) => setFavs(prev => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n })
 
@@ -133,83 +170,62 @@ function App() {
       const objUrl = URL.createObjectURL(blob)
       const a = document.createElement("a")
       a.href = objUrl
-      const safeTitle = p.title.replace(/[^a-z0-9]/gi, "_").toLowerCase()
-      const suffix = resolution.includes("4K") ? "4K" : resolution.includes("Mobile") ? "mobile" : resolution.includes("Ultrawide") ? "ultrawide" : "HD"
-      a.download = `${safeTitle}-${p.artist.replace(/\s+/g, "_")}-${suffix}.jpg`
-      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(objUrl)
+      a.download = wallpaperFilename(p, resolution)
+      document.body.appendChild(a); a.click(); a.remove(); window.setTimeout(() => URL.revokeObjectURL(objUrl), 1_000)
       setToast("Download started — check downloads")
     } catch {
-      window.open(url, "_blank")
-      setToast("Opened HD image — long-press to save")
+      window.open(url, "_blank", "noopener,noreferrer")
+      setToast("Image opened in a new tab — save it from there")
     } finally { setDownloading(false) }
+  }
+
+  const setWallpaper = async (p: Painting) => {
+    try {
+      if (await setNativeWallpaper(getResizedUrl(p, resolution))) {
+        setToast("Wallpaper updated")
+        return
+      }
+      setToast("Download it, then choose “Set as wallpaper” in Photos or system settings")
+    } catch {
+      setToast("Native wallpaper bridge failed; download the image instead")
+    }
+  }
+
+  const toggleDaily = async (enabled: boolean) => {
+    setAutoDaily(enabled)
+    if (!enabled) return
+    const index = Math.floor(Date.now() / 86_400_000) % paintings.length
+    setActive(paintings[index])
+    try {
+      localStorage.setItem("mw_day_index", String(index))
+      if ("Notification" in window && Notification.permission === "default") await Notification.requestPermission()
+    } catch {}
+  }
+
+  const installApp = async () => {
+    if (!installPrompt) return
+    await installPrompt.prompt()
+    const choice = await installPrompt.userChoice
+    setInstallPrompt(null)
+    setToast(choice.outcome === "accepted" ? "Install started" : "Install dismissed")
   }
 
   const fetchLiveMasterpiece = async () => {
     setLiveLoading(true)
     try {
-      const searchTermsFamous = ["monet", "van gogh", "rembrandt", "picasso", "cezanne", "degas", "renoir", "manet", "vermeer", "turner"]
-      const searchTermsLatest = ["contemporary", "abstract", "impressionism", "portrait"]
-      const termPool = liveMode === "latest" ? searchTermsLatest : liveMode === "famous" ? searchTermsFamous : [...searchTermsFamous, ...searchTermsLatest]
-      const term = termPool[Math.floor(Math.random() * termPool.length)]
-      const params = new URLSearchParams({
-        q: term,
-        limit: liveMode === "latest" ? "30" : "30",
-        "query[term][is_public_domain]": "true",
-        "query[term][artwork_type_title]": "Painting",
-        fields: "id,title,artist_title,date_display,style_title,image_id,thumbnail,artwork_type_title,date_start",
-      })
-      // latest: sort by date_start desc via search params not directly supported, so we randomize and let client pick newer date_start
-      const res = await fetch(`https://api.artic.edu/api/v1/artworks/search?${params.toString()}`)
-      if (!res.ok) throw new Error(`artic ${res.status}`)
-      const data = await res.json()
-      let candidates = (data.data as any[])?.filter((d: any) => d.image_id && d.artwork_type_title === "Painting") || []
-      if (liveMode === "latest") candidates = [...candidates].sort((a, b) => (b.date_start || 0) - (a.date_start || 0))
-      else candidates = [...candidates].sort(() => Math.random() - 0.5)
-      if (!candidates.length) throw new Error("no results")
-      let chosen: Painting | null = null
-      for (const pick of candidates.slice(0, 6)) {
-        const url = `https://www.artic.edu/iiif/2/${pick.image_id}/full/843,/0/default.jpg`
-        try { await preloadImage(url, 5500); chosen = {
-          id: `live-${pick.id}`, title: pick.title || "Untitled", artist: pick.artist_title || "Unknown artist", year: pick.date_display || String(pick.date_start || ""), style: pick.style_title || "Painting", museum: "Art Institute of Chicago",
-          image: url, thumb: `https://www.artic.edu/iiif/2/${pick.image_id}/full/400,/0/default.jpg`,
-          colors: ["#1a1a1a", "#c9a86a", "#6b7a8a"],
-          description: `Live from the Art Institute of Chicago — ${liveMode === "latest" ? "recent acquisition" : "public domain masterpiece"} • search: "${term}"`,
-          aspect: "4:3", license: "CC0 — Art Institute Open Access"
-        }; break } catch {}
-      }
-      if (!chosen) throw new Error("no loadable image")
-      setLivePainting(chosen); setActive(chosen); setImgError(false)
-      setToast(`Live ${liveMode}: ${chosen.title} — ${chosen.artist}`)
-      window.scrollTo({ top: 0, behavior: "smooth" }); return
-    } catch (e) {
-      console.warn("ArtIC failed, trying Met", e)
-      try {
-        const metIds = [438012, 436532, 437392, 436121, 459116, 337347, 435882, 436105, 437853, 459055, 544228, 437790, 436667, 437133, 459080, 544525, 459193, 544446]
-        const tries = [...metIds].sort(() => Math.random() - 0.5).slice(0, 4)
-        for (const metId of tries) {
-          const r = await fetch(`https://collectionapi.metmuseum.org/public/collection/v1/objects/${metId}`)
-          if (!r.ok) continue
-          const j = await r.json()
-          if (j.primaryImage) {
-            try { await preloadImage(j.primaryImage, 5500) } catch { continue }
-            const live: Painting = {
-              id: `met-${j.objectID}`, title: j.title, artist: j.artistDisplayName || j.artistDisplayBio || "Unknown", year: j.objectDate || "",
-              style: j.medium?.split(",")[0] || "Painting", museum: "The Met, New York",
-              image: j.primaryImage, thumb: j.primaryImageSmall || j.primaryImage,
-              colors: ["#1a1a1a", "#c9a86a", "#6b7a8a"],
-              description: j.artistDisplayBio || j.medium || "From the Metropolitan Museum of Art — public domain.",
-              aspect: "4:3", license: "CC0 — The Met Open Access"
-            }
-            setLivePainting(live); setActive(live); setImgError(false)
-            setToast(`Live from The Met: ${j.title}`); return
-          }
-        }
-        throw new Error("no met image")
-      } catch {
-        setToast("Live fetch failed — using curated")
-        randomize()
-      }
-    } finally { setLiveLoading(false) }
+      const live = await fetchLivePainting(liveMode, [active.id, ...history])
+      setLivePainting(live)
+      setActive(live)
+      setImgError(false)
+      setToast("Live " + liveMode + ": " + live.title + " — " + live.artist)
+      window.scrollTo({ top: 0, behavior: "smooth" })
+    } catch (error) {
+      console.warn("Live artwork fetch failed", error)
+      setToast("Live sources are unavailable — showing curated art")
+      randomize()
+    } finally {
+      setLiveLoading(false)
+    }
   }
 
   const activeUrl = getResizedUrl(active, resolution)
@@ -252,8 +268,8 @@ function App() {
           <div className="relative group overflow-hidden rounded-[28px] bg-zinc-900 border border-zinc-800">
             <div className="absolute inset-0 bg-gradient-to-t from-black/75 via-black/10 to-transparent z-10 pointer-events-none" />
             {!imgError ? (
-              <img key={active.id} src={activeUrl} alt={`${active.title} by ${active.artist}`} className={`w-full h-[500px] sm:h-[620px] lg:h-[700px] object-center transition duration-700 group-hover:scale-[1.02] ${coverMode==="cover"?"object-cover":"object-contain bg-zinc-800"}`} crossOrigin="anonymous" loading="eager"
-                onError={() => { console.warn("hero image failed", activeUrl); setImgError(true); setToast("Image failed — trying another"); setTimeout(()=>{ const pool = paintings.filter(p=>p.id!==active.id); const n = pool[Math.floor(Math.random()*pool.length)]; setActive(n); setImgError(false)}, 900)}}
+              <img key={active.id} src={activeUrl} alt={`${active.title} by ${active.artist}`} className={`w-full h-[500px] sm:h-[620px] lg:h-[700px] object-center transition duration-700 group-hover:scale-[1.02] ${coverMode==="cover"?"object-cover":"object-contain bg-zinc-800"}`} loading="eager"
+                onError={() => { console.warn("hero image failed", activeUrl); setImgError(true); setToast("Image failed — trying another"); const fallback = paintings.find(p => p.id !== active.id); if (fallback) setTimeout(() => { setActive(fallback); setImgError(false) }, 500) }}
                 onLoad={()=>setImgError(false)} />
             ) : (
               <div className="w-full h-[500px] sm:h-[620px] lg:h-[700px] grid place-items-center bg-zinc-800 text-zinc-400 p-8 text-center">
@@ -285,7 +301,7 @@ function App() {
               <p className="mt-3 max-w-2xl text-sm leading-relaxed text-zinc-300 line-clamp-2 sm:line-clamp-none">{active.description}</p>
               <div className="mt-4 flex flex-wrap gap-2.5">
                 <button onClick={()=>downloadHD(active)} disabled={downloading} className="inline-flex items-center gap-2 px-5 sm:px-6 py-3 rounded-full bg-white text-black font-bold text-sm hover:bg-zinc-100 transition disabled:opacity-60">{downloading?"Preparing…":"⬇ Download"} <span className="hidden sm:inline text-zinc-500 font-medium">• {resolution.split("(")[0].trim()}</span></button>
-                <button onClick={randomize} className="inline-flex items-center gap-2 px-5 sm:px-6 py-3 rounded-full bg-amber-500 text-black font-bold text-sm hover:bg-amber-400 transition">↻ New wallpaper</button>
+                <button onClick={()=>setWallpaper(active)} className="inline-flex items-center gap-2 px-5 sm:px-6 py-3 rounded-full bg-amber-500 text-black font-bold text-sm hover:bg-amber-400 transition">Set as wallpaper</button>
                 <button onClick={()=>setDetail(active)} className="inline-flex items-center gap-2 px-4 sm:px-5 py-3 rounded-full bg-black/40 backdrop-blur border border-white/20 text-white font-semibold text-sm hover:bg-black/60 transition">Details</button>
                 <button onClick={()=>sharePainting(active)} className="inline-flex items-center gap-2 px-4 py-3 rounded-full bg-zinc-800 border border-zinc-700 text-white font-semibold text-sm hover:bg-zinc-700 transition">Share ↗</button>
               </div>
@@ -300,9 +316,9 @@ function App() {
           <div className="flex flex-col gap-5">
             <div className="rounded-[24px] bg-zinc-900 border border-zinc-800 p-5 sm:p-6">
               <h3 className="font-serif text-xl font-bold">Get a new masterpiece</h3>
-              <p className="mt-1 text-sm text-zinc-400 leading-relaxed">Every wallpaper is a real painting — no AI, no stock. {paintings.length} curated + ∞ live (Met, ArtIC, Rijks — public domain, 4K).</p>
+              <p className="mt-1 text-sm text-zinc-400 leading-relaxed">Every wallpaper is a real painting — no AI, no stock. {paintings.length} curated + live discovery from the Met, Chicago, and Wikimedia Commons.</p>
               <div className="mt-4 flex gap-2">
-                {(["famous","latest","random"] as LiveMode[]).map(m => (
+                {(["popular","latest","random"] as LiveMode[]).map(m => (
                   <button key={m} onClick={()=>setLiveMode(m)} className={`flex-1 py-2 rounded-full text-xs font-bold border capitalize transition ${liveMode===m?"bg-white text-black border-white":"bg-zinc-800 text-zinc-300 border-zinc-700 hover:bg-zinc-700"}`}>{m}</button>
                 ))}
               </div>
@@ -319,15 +335,15 @@ function App() {
                 <div className="flex items-center justify-between">
                   <label className="text-xs font-semibold tracking-widest text-zinc-400">RESOLUTION</label>
                   <label className="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer">
-                    <input type="checkbox" checked={autoDaily} onChange={e=>setAutoDaily(e.target.checked)} className="accent-amber-500" /> Daily lock
+                    <input type="checkbox" checked={autoDaily} onChange={e=>void toggleDaily(e.target.checked)} className="accent-amber-500" /> Daily wallpaper
                   </label>
                 </div>
                 <div className="mt-2 grid grid-cols-2 gap-2">
-                  {(["HD (1920×1080)","4K (3840×2160)","Mobile (1080×1920)","Ultrawide (2560×1080)","Original"] as Resolution[]).map(r => (
+                  {resolutionOptions.map(r => (
                     <button key={r} onClick={()=>setResolution(r)} className={`px-3 py-2.5 rounded-xl text-xs font-semibold border transition text-left leading-tight ${resolution===r?"bg-white text-black border-white":"bg-zinc-800 text-zinc-300 border-zinc-700 hover:bg-zinc-700"}`}>{r}</button>
                   ))}
                 </div>
-                <p className="mt-2 text-[11px] text-zinc-500">Wikimedia thumbs: 1080/1920/2560px • IIIF: width param • Met: original max</p>
+                <p className="mt-2 text-[11px] text-zinc-500">IIIF and Wikimedia receive a target-width URL when available; original files stay unchanged otherwise.</p>
               </div>
 
               <div className="mt-5">
@@ -354,6 +370,7 @@ function App() {
               <div className="mt-5 rounded-2xl bg-gradient-to-br from-amber-500/15 to-orange-600/15 border border-amber-500/20 p-4">
                 <p className="text-sm font-bold text-amber-200">📱 Install as app</p>
                 <p className="mt-1 text-xs leading-relaxed text-zinc-300">Mobile: Chrome → ⋮ → Add to Home Screen. Then fullscreen + offline. For native iOS/Android use Capacitor (see README).</p>
+                {installPrompt && <button onClick={installApp} className="mt-3 px-4 py-2 rounded-full bg-white text-black text-xs font-bold">Install Masterpiece</button>}
               </div>
             </div>
 
@@ -392,8 +409,14 @@ function App() {
             <select value={museumFilter} onChange={e=>setMuseumFilter(e.target.value)} className="hidden lg:block xl:w-[180px] px-3 py-3 rounded-2xl bg-zinc-800 border border-zinc-700 text-sm text-white focus:outline-none">
               <option>All museums</option>{museums.map(m=><option key={m}>{m}</option>)}
             </select>
-            <select value={sort} onChange={e=>setSort(e.target.value as any)} className="w-[130px] px-3 py-3 rounded-2xl bg-zinc-800 border border-zinc-700 text-sm text-white focus:outline-none">
-              <option value="shuffle">Shuffle</option><option value="artist">Sort: Artist</option><option value="year">Sort: Year</option>
+            <select value={periodFilter} onChange={e=>setPeriodFilter(e.target.value)} className="hidden md:block xl:w-[130px] px-3 py-3 rounded-2xl bg-zinc-800 border border-zinc-700 text-sm text-white focus:outline-none">
+              <option>All periods</option>{periods.map(p=><option key={p}>{p}</option>)}
+            </select>
+            <select value={paletteFilter} onChange={e=>setPaletteFilter(e.target.value as Palette)} className="hidden sm:block xl:w-[120px] px-3 py-3 rounded-2xl bg-zinc-800 border border-zinc-700 text-sm text-white focus:outline-none">
+              {paletteOptions.map(p=><option key={p}>{p}</option>)}
+            </select>
+            <select value={sort} onChange={e=>{ const value = e.target.value as SortMode; setSort(value); if (value === "random") setRandomSeed(Date.now()) }} className="w-[130px] px-3 py-3 rounded-2xl bg-zinc-800 border border-zinc-700 text-sm text-white focus:outline-none">
+              <option value="popular">Popular</option><option value="latest">Latest</option><option value="random">Random</option>
             </select>
           </div>
           <div className="flex items-center gap-3 text-sm text-zinc-400 justify-between xl:justify-end">
@@ -408,12 +431,12 @@ function App() {
         {filtered.length===0 ? (
           <div className="py-20 text-center rounded-[24px] bg-zinc-900 border border-zinc-800">
             <p className="text-zinc-400">No matches. Try another artist or clear filters.</p>
-            <button onClick={()=>{setSearch(""); setArtistFilter("All artists"); setStyleFilter("All styles"); setMuseumFilter("All museums"); setShowFavsOnly(false)}} className="mt-4 px-5 py-2 rounded-full bg-white text-black font-semibold text-sm">Clear filters</button>
+            <button onClick={()=>{setSearch(""); setArtistFilter("All artists"); setStyleFilter("All styles"); setMuseumFilter("All museums"); setPeriodFilter("All periods"); setPaletteFilter("All colors"); setShowFavsOnly(false)}} className="mt-4 px-5 py-2 rounded-full bg-white text-black font-semibold text-sm">Clear filters</button>
           </div>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
-            {filtered.map(p => (
-              <article key={p.id} className={`group relative overflow-hidden rounded-[20px] bg-zinc-900 border transition cursor-pointer flex flex-col ${active.id===p.id?"border-amber-500/50 ring-2 ring-amber-500/20":"border-zinc-800 hover:border-zinc-700"}`} onClick={()=>setActive(p)}>
+            {visiblePaintings.map(p => (
+              <article key={p.id} className={`group relative overflow-hidden rounded-[20px] bg-zinc-900 border transition cursor-pointer flex flex-col [content-visibility:auto] ${active.id===p.id?"border-amber-500/50 ring-2 ring-amber-500/20":"border-zinc-800 hover:border-zinc-700"}`} onClick={()=>setActive(p)}>
                 <div className="relative overflow-hidden">
                   <img src={p.thumb} alt={`${p.title} by ${p.artist}`} loading="lazy" onError={e=>{(e.currentTarget as HTMLImageElement).style.display="none"}} className="w-full h-[260px] object-cover transition duration-500 group-hover:scale-[1.04]" />
                   <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/0 to-transparent opacity-80" />
@@ -422,7 +445,7 @@ function App() {
                   </div>
                   <button onClick={e=>{e.stopPropagation(); toggleFav(p.id)}} aria-label="favorite" className={`absolute top-3 right-3 w-8 h-8 rounded-full grid place-items-center backdrop-blur border text-sm transition ${favs.has(p.id)?"bg-amber-500 border-amber-400 text-black":"bg-black/50 border-white/15 text-white"}`}>{favs.has(p.id)?"♥":"♡"}</button>
                   <div className="absolute bottom-3 left-3 right-3 flex gap-2">
-                    <button onClick={e=>{e.stopPropagation(); setActive(p); window.scrollTo({top:0, behavior:"smooth"})}} className="flex-1 py-2 rounded-full bg-white text-black text-xs font-bold hover:bg-zinc-100 transition">Set wallpaper</button>
+                    <button onClick={e=>{e.stopPropagation(); setActive(p); void setWallpaper(p)}} className="flex-1 py-2 rounded-full bg-white text-black text-xs font-bold hover:bg-zinc-100 transition">Set wallpaper</button>
                     <button onClick={e=>{e.stopPropagation(); setDetail(p)}} className="px-3 py-2 rounded-full bg-black/60 backdrop-blur border border-white/15 text-white text-xs font-semibold">Details</button>
                   </div>
                   {active.id===p.id && <span className="absolute bottom-3 right-3 hidden sm:inline-flex translate-y-[-44px] px-2 py-1 rounded-full bg-amber-500 text-black text-[10px] font-bold tracking-widest">ACTIVE</span>}
@@ -439,8 +462,9 @@ function App() {
             ))}
           </div>
         )}
+        {visibleCount < filtered.length && <div ref={moreRef} className="mt-8 text-center"><button onClick={()=>setVisibleCount(count => Math.min(count + 16, filtered.length))} className="px-5 py-2.5 rounded-full bg-zinc-800 border border-zinc-700 text-white text-sm font-semibold">Show more ({filtered.length - visibleCount} remaining)</button></div>}
         <div className="mt-8 rounded-[20px] border border-dashed border-zinc-700 p-6 text-center">
-          <p className="text-sm text-zinc-400">Want infinite? Use <b className="text-zinc-200">✨ Live</b> — famous/latest/random public-domain from Chicago & The Met. No key.</p>
+          <p className="text-sm text-zinc-400">Discover more through <b className="text-zinc-200">✨ Live</b> — public-domain results from Chicago, The Met, then Wikimedia Commons. No key.</p>
           <div className="mt-3 flex justify-center gap-3 flex-wrap">
             <button onClick={fetchLiveMasterpiece} disabled={liveLoading} className="px-5 py-2.5 rounded-full bg-amber-500 text-black font-bold text-sm disabled:opacity-60">{liveLoading?"Fetching…":`Fetch live ${liveMode}`}</button>
             <button onClick={randomize} className="px-5 py-2.5 rounded-full bg-zinc-800 border border-zinc-700 text-white font-semibold text-sm">Shuffle curated</button>
@@ -452,21 +476,23 @@ function App() {
       {detail && (
         <div className="fixed inset-0 z-50 grid place-items-center p-4">
           <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={()=>setDetail(null)} />
-          <div className="relative w-full max-w-5xl max-h-[90vh] overflow-auto rounded-[28px] bg-zinc-900 border border-zinc-800">
+          <div role="dialog" aria-modal="true" aria-labelledby="detail-title" className="relative w-full max-w-5xl max-h-[90vh] overflow-auto rounded-[28px] bg-zinc-900 border border-zinc-800">
             <button onClick={()=>setDetail(null)} className="absolute top-4 right-4 z-10 w-9 h-9 rounded-full bg-black/60 backdrop-blur border border-white/20 text-white grid place-items-center hover:bg-black/80">✕</button>
             <div className="grid lg:grid-cols-[1.3fr_0.9fr] gap-0">
               <img src={getResizedUrl(detail, resolution)} alt={detail.title} className={`w-full h-[420px] lg:h-[640px] ${coverMode==="cover"?"object-cover":"object-contain bg-zinc-800"}`} />
               <div className="p-6 sm:p-8">
                 <span className="inline-flex px-3 py-1 rounded-full bg-amber-500 text-black text-xs font-bold tracking-widest">{detail.style} • {detail.year}</span>
-                <h3 className="mt-3 font-serif text-3xl font-bold leading-none">{detail.title}</h3>
+                <h3 id="detail-title" className="mt-3 font-serif text-3xl font-bold leading-none">{detail.title}</h3>
                 <p className="mt-2 text-zinc-300"><span className="font-semibold text-white">{detail.artist}</span> • {detail.museum}</p>
-                <p className="mt-1 text-xs text-zinc-500">{detail.license} • {detail.aspect}</p>
+                <p className="mt-1 text-xs text-zinc-500">{detail.license} • {detail.period} • {detail.aspect}</p>
                 <p className="mt-4 text-sm leading-relaxed text-zinc-400">{detail.description}</p>
                 <div className="mt-6 flex flex-wrap gap-2">{detail.colors.map(c=><span key={c} className="w-7 h-7 rounded-full border border-white/10" style={{background:c}} />)}</div>
                 <div className="mt-8 grid gap-3">
-                  <button onClick={()=>{setActive(detail); setDetail(null); window.scrollTo({top:0,behavior:"smooth"})}} className="w-full py-3.5 rounded-2xl bg-amber-500 text-black font-bold">Use as wallpaper</button>
+                  <button onClick={()=>setWallpaper(detail)} className="w-full py-3.5 rounded-2xl bg-amber-500 text-black font-bold">Set as wallpaper</button>
                   <button onClick={()=>downloadHD(detail)} className="w-full py-3.5 rounded-2xl bg-white text-black font-bold">⬇ Download {resolution.split("(")[0].trim()}</button>
                   <button onClick={()=>sharePainting(detail)} className="w-full py-3 rounded-2xl bg-zinc-800 border border-zinc-700 text-white font-semibold">Share ↗</button>
+                  {safeExternalUrl(detail.museumUrl) && <a href={safeExternalUrl(detail.museumUrl)} target="_blank" rel="noreferrer" className="w-full py-3 rounded-2xl bg-zinc-800 border border-zinc-700 text-white text-center font-semibold">View museum collection ↗</a>}
+                  {safeExternalUrl(detail.sourceUrl) && <a href={safeExternalUrl(detail.sourceUrl)} target="_blank" rel="noreferrer" className="w-full py-3 rounded-2xl bg-zinc-800 border border-zinc-700 text-white text-center font-semibold">View image source ↗</a>}
                 </div>
                 <p className="mt-4 text-xs leading-relaxed text-zinc-500">Public domain — free for personal wallpaper. Check museum license for prints. Image via Wikimedia / IIIF / Met — {resolution}.</p>
               </div>
