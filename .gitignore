@@ -11,6 +11,15 @@ node_modules
 dist
 dist-ssr
 *.local
+.env
+.env.local
+
+# Capacitor — platforms are generated locally, commit only config
+ios/
+android/
+# keep public assets inside platforms ignored if platforms are committed
+ios/App/public
+android/app/src/main/assets/public
 
 # Editor directories and files
 .vscode/*
