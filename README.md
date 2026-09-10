@@ -4,9 +4,10 @@ Masterpiece is a Vite + React PWA for finding real paintings and saving them as 
 
 ## What ships
 
-- 57 curated public-domain paintings from Wikimedia Commons, spanning Renaissance, Baroque, Impressionism, Ukiyo-e, Romanticism, and more.
+- 56 curated public-domain paintings from Wikimedia Commons, spanning Renaissance, Baroque, Impressionism, Ukiyo-e, Romanticism, and more. Every file is served at 1920px where the source allows and never below the 1280px HD floor.
 - Live discovery with a short, verified fallback chain: Art Institute of Chicago → The Met → Wikimedia Commons.
-- Public-domain and painting filters are applied before an Art Institute result is used. A candidate image is preloaded before it becomes the hero.
+- Public-domain and painting filters are applied before an Art Institute result is used.
+- Nothing reaches the hero unverified: every selection — curated, live, daily or shuffled — is decoded with a 1.5s budget first, and a source that fails or stalls falls back to curated art instead of showing a broken image.
 - Resolution-aware download URLs: HD/FHD 1920px, 4K 3840px, ultrawide 2560px, mobile 1080px, or the untouched original.
 - Blob download with a browser-tab fallback for cross-origin servers; filenames are normalized as artist-title-resolution.jpg.
 - Favorite, history, daily wallpaper selection, search, artist/style/museum/period/color filters, popular/latest/random order, details, share, and progressive gallery rendering.
@@ -16,7 +17,17 @@ Masterpiece is a Vite + React PWA for finding real paintings and saving them as 
 
 ## Rights policy
 
-Only public-domain curated works are included. Fair-use image files (including the previously included Picasso and Dalí entries) were removed. Every curated detail view has a holding-museum link and the direct Commons source. Live results preserve the provider’s license metadata; verify a live Commons file page before use beyond personal wallpaper.
+Only public-domain curated works are included. Every curated entry links both its holding museum and its Commons **file page** — the page that actually states the licence and author, which a raw `upload.wikimedia.org` JPEG does not. Live results preserve the provider’s licence metadata; verify a live Commons file page before use beyond personal wallpaper.
+
+### Catalogue audit
+
+The curated set was audited against the Commons API rather than trusted as written, because a Commons URL that looks plausible can still point at nothing. Commons derives a file's two path segments from `md5(filename)`, so a hand-written path is verifiable offline — and 29 of the previous 57 entries had paths that could not resolve, 23 of them naming files that do not exist on Commons at all. Those were re-sourced from verified public-domain files; one entry (*Plum Blossom in Kameido*) had no public-domain Commons file at HD and was dropped; and *Water Lilies* was replaced because the file in use was CC BY-SA 2.5, not public domain, and below the HD floor.
+
+`npm test` now recomputes every path hash offline, so a broken or invented URL fails the suite instead of reaching a user.
+
+### Wikimedia thumbnail widths
+
+Wikimedia renders only a fixed ladder of widths — 20, 40, 60, 120, 250, 330, 500, 960, 1280, 1920, 3840 — and since [T414805](https://phabricator.wikimedia.org/T414805) it **rejects** a direct request for any other size. An app that asks for 600px, 1080px or 2560px therefore gets an error page, not an image. `getResizedUrl` snaps every Wikimedia request onto that ladder, and when the requested size exceeds the width stored for a work it serves the original upload — always larger, and never a 404, since Wikimedia will not upscale. The Art Institute's IIIF endpoint has no such restriction, so those requests stay exact.
 
 ## Data sources
 
@@ -25,8 +36,8 @@ Only public-domain curated works are included. Fair-use image files (including t
 | [Art Institute of Chicago](https://api.artic.edu/docs/) | No | Primary live search. Supports public-domain and painting filters. | IIIF image URLs; use only records marked public domain. |
 | [The Met Collection API](https://metmuseum.github.io/) | No | Failover source with explicit isPublicDomain field. | Open Access records and original image URLs. |
 | [Wikimedia Commons](https://www.mediawiki.org/wiki/API:Imageinfo) | No | Curated files and final live fallback. | Per-file licenses; public-domain curation is reviewed manually. |
-| [Rijksmuseum Data Services](https://data.rijksmuseum.nl/docs/search) | No for the current Search API | Good future metadata source. | Not enabled for live image fetching until object-level rights handling is added. |
-| Europeana | API key | Broad discovery only. | Metadata is CC0 but previews have record-level rights, so it is not used by default. |
+
+No source needs an API key, and none is configured. The Rijksmuseum and Europeana were evaluated and are deliberately not wired up: Europeana previews carry record-level rights that would risk showing non-public-domain images, and the Rijksmuseum Search API needs object-level rights handling first.
 
 ## Run locally
 
@@ -41,26 +52,9 @@ Open http://localhost:5173. The production build is written to `dist`.
 
 ## Install and wallpaper use
 
-### PWA
-
 On Android/desktop Chromium, use the in-app **Install Masterpiece** button when it appears or the browser’s install menu. On Safari iOS/iPadOS, use Share → Add to Home Screen. The installed app keeps the shell and recently requested images available offline.
 
-Browsers cannot change an operating-system wallpaper directly. Download the artwork, then choose **Set as wallpaper** from Photos or the system’s appearance/wallpaper settings.
-
-### Capacitor wrapper
-
-`capacitor.config.ts` is set up with `webDir: dist` and `appId: com.masterpiece.wallpapers`.
-
-```bash
-npm run build
-npx cap add ios
-npx cap add android
-npm run cap:copy
-npm run cap:open:ios
-npm run cap:open:android
-```
-
-The web app detects an optional native `Wallpaper.setWallpaper({ url })` bridge. An Android host can implement that bridge with `WallpaperManager`; iOS does not provide a public API that allows an app to set the user’s home or lock wallpaper. The browser/PWA remains the baseline.
+No browser can change an operating-system wallpaper, and iOS exposes no native API for it either. **Set as wallpaper** therefore downloads the image at the chosen resolution and then tells you where your platform’s own control lives — Photos → Share → Use as Wallpaper on iOS, the gallery’s ⋮ menu on Android, and the desktop right-click menu otherwise.
 
 ## Deployment
 
@@ -69,12 +63,13 @@ Vercel uses `npm run build` and serves `dist` through `vercel.json`. Netlify can
 ## Verification
 
 ```bash
-npm test       # 8 unit tests: data shape, source URLs, search, URL sizing, image preload
+npm test       # 8 unit tests: catalogue integrity, md5 path validation, HD floor,
+               # resolution URLs, preload + timeout, aspect/palette helpers, search
 npm run build  # TypeScript + Vite + PWA service worker
 npm run lint
 ```
 
-The current production build is about 81 kB gzipped JavaScript, below the 250 kB budget. Run a deployed Lighthouse audit for environment-specific PWA, performance, and accessibility scores; scores cannot be meaningfully guaranteed from a local static build alone.
+The current production build is about 80 kB gzipped JavaScript, below the 250 kB budget, and the service worker precaches 8 entries. Run a deployed Lighthouse audit for environment-specific PWA, performance, and accessibility scores; scores cannot be meaningfully guaranteed from a local static build alone.
 
 ## License
 

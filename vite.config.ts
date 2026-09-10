@@ -16,13 +16,15 @@ export default defineConfig({
         start_url: '/',
         display: 'standalone',
         background_color: '#0a0a0b',
-        theme_color: '#f59e0b',
+        theme_color: '#0a0a0b',
         icons: [
           { src: '/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any maskable' },
           { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any maskable' }
         ]
       },
       workbox: {
+        // Painting files are immutable at a given width, so CacheFirst is safe for images;
+        // the Met's JSON can change, so it stays NetworkFirst.
         runtimeCaching: [
           { urlPattern: /^https:\/\/upload\.wikimedia\.org\/.*/i, handler: 'CacheFirst', options: { cacheName: 'wikimedia-images', expiration: { maxEntries: 100, maxAgeSeconds: 60*60*24*30 }, cacheableResponse: { statuses: [0,200] } } },
           { urlPattern: /^https:\/\/www\.artic\.edu\/iiif\/.*/i, handler: 'CacheFirst', options: { cacheName: 'artic-iiif', expiration: { maxEntries: 50, maxAgeSeconds: 60*60*24*7 } } },

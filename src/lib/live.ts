@@ -1,5 +1,5 @@
 import type { Painting } from "../data/paintings"
-import { fetchWithTimeout, periodForYear, preloadImage } from "./wallpapers"
+import { aspectLabelFor, fallbackColors, fetchWithTimeout, periodForYear, preloadImage } from "./wallpapers"
 
 export type LiveMode = "popular" | "latest" | "random"
 
@@ -41,6 +41,8 @@ type WikimediaPage = {
 const cache = new Map<LiveMode, { expiresAt: number; painting: Painting }>()
 const famousTerms = ["Monet", "van Gogh", "Rembrandt", "Vermeer", "Hokusai", "Turner", "Renoir", "Cézanne", "Degas", "Munch"]
 const latestTerms = ["painting", "modern painting", "portrait", "landscape"]
+/** Matches the app-wide preload budget: a slow source is skipped, never shown broken. */
+const LIVE_PRELOAD_MS = 1_500
 const metIds = [436535, 437133, 437853, 438012, 436121, 436105, 459055, 459080, 459193, 544525, 544228, 337347]
 
 function randomItem<T>(items: T[]): T {
@@ -60,9 +62,9 @@ function makeArticPainting(artwork: ArticArtwork): Painting {
     museumUrl: `https://www.artic.edu/artworks/${artwork.id}`,
     image: `https://www.artic.edu/iiif/2/${artwork.image_id}/full/1686,/0/default.jpg`,
     thumb: `https://www.artic.edu/iiif/2/${artwork.image_id}/full/600,/0/default.jpg`,
-    colors: ["#171717", "#c9a86a", "#6b7a8a"],
+    colors: fallbackColors,
     description: "Public-domain artwork from the Art Institute of Chicago Open Access collection.",
-    aspect: "Artwork source",
+    aspect: "4:3",
     license: "Public domain — Art Institute of Chicago Open Access",
     sourceUrl: `https://www.artic.edu/artworks/${artwork.id}`,
   }
@@ -81,11 +83,29 @@ function makeMetPainting(item: MetObject): Painting {
     museumUrl: item.objectURL || `https://www.metmuseum.org/art/collection/search/${item.objectID}`,
     image: item.primaryImage || "",
     thumb: item.primaryImageSmall || item.primaryImage || "",
-    colors: ["#171717", "#c9a86a", "#6b7a8a"],
+    colors: fallbackColors,
     description: item.artistDisplayBio || item.medium || "Public-domain artwork from The Met Open Access collection.",
-    aspect: "Artwork source",
+    aspect: "4:3",
     license: "Public domain — The Met Open Access",
     sourceUrl: item.objectURL || `https://www.metmuseum.org/art/collection/search/${item.objectID}`,
+  }
+}
+
+/**
+ * Screen a candidate before it is offered as a wallpaper, and fill in the aspect that
+ * only a decoded image can supply. The thumbnail is used deliberately: an original from
+ * the Met can be tens of megabytes, which would never decode inside the preload budget,
+ * and every source derives its thumbnail from the same file at the same ratio. The hero
+ * URL itself is preloaded again by the app before it is ever displayed.
+ * Returns null instead of throwing so callers can simply move to the next candidate.
+ */
+async function verify(painting: Painting): Promise<Painting | null> {
+  if (!painting.image || !painting.thumb) return null
+  try {
+    const loaded = await preloadImage(painting.thumb, LIVE_PRELOAD_MS)
+    return { ...painting, aspect: aspectLabelFor(loaded.naturalWidth, loaded.naturalHeight) }
+  } catch {
+    return null
   }
 }
 
@@ -109,13 +129,9 @@ async function fromArtic(mode: LiveMode, excluded: Set<string>): Promise<Paintin
   else candidates = candidates.sort(() => Math.random() - 0.5)
 
   for (const candidate of candidates.slice(0, 3)) {
-    const painting = makeArticPainting(candidate)
-    try {
-      await preloadImage(painting.thumb, 1_500)
-      return painting
-    } catch {
-      // The IIIF CDN can intermittently reject a browser request. Try another work.
-    }
+    const verified = await verify(makeArticPainting(candidate))
+    // The IIIF CDN can intermittently reject a browser request. Try another work.
+    if (verified) return verified
   }
   throw new Error("No loadable Art Institute image")
 }
@@ -127,13 +143,9 @@ async function fromMet(excluded: Set<string>): Promise<Painting> {
     if (!response.ok) continue
     const item = await response.json() as MetObject
     if (!item.isPublicDomain || !item.primaryImage || excluded.has(`met-${item.objectID}`)) continue
-    const painting = makeMetPainting(item)
-    try {
-      await preloadImage(painting.thumb, 1_500)
-      return painting
-    } catch {
-      // Continue to a verified image rather than exposing a broken hero.
-    }
+    // Continue to a verified image rather than exposing a broken hero.
+    const verified = await verify(makeMetPainting(item))
+    if (verified) return verified
   }
   throw new Error("No loadable Met image")
 }
@@ -174,18 +186,15 @@ async function fromWikimedia(mode: LiveMode, excluded: Set<string>): Promise<Pai
       museumUrl: info.descriptionurl || "https://commons.wikimedia.org",
       image: info.url,
       thumb: info.thumburl,
-      colors: ["#171717", "#c9a86a", "#6b7a8a"],
+      colors: fallbackColors,
       description: "Public-domain or openly licensed image discovered through Wikimedia Commons. Confirm the file page before commercial reuse.",
-      aspect: "Artwork source",
+      aspect: "4:3",
       license: info.extmetadata?.LicenseShortName?.value || "See Wikimedia file page",
       sourceUrl: info.descriptionurl || info.url,
     }
-    try {
-      await preloadImage(painting.thumb, 1_500)
-      return painting
-    } catch {
-      // Try another Commons file.
-    }
+    // Try another Commons file if this one will not load.
+    const verified = await verify(painting)
+    if (verified) return verified
   }
   throw new Error("No loadable Wikimedia image")
 }

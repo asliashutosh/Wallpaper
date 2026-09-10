@@ -1,8 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { paintings, artists, styles, museums, periods, type Painting } from "./data/paintings"
 import { fetchLivePainting, type LiveMode } from "./lib/live"
-import { setNativeWallpaper } from "./lib/native-wallpaper"
-import { getResizedUrl, resolutionOptions, wallpaperFilename, yearSortValue, type Resolution } from "./lib/wallpapers"
+import {
+  extractPalette,
+  fallbackColors,
+  getResizedUrl,
+  preloadImage,
+  resolutionOptions,
+  wallpaperFilename,
+  wallpaperInstructions,
+  yearSortValue,
+  type Resolution,
+} from "./lib/wallpapers"
 
 type CoverMode = "cover" | "contain"
 type SortMode = "popular" | "latest" | "random"
@@ -10,6 +19,10 @@ type Palette = "All colors" | "Blue" | "Gold" | "Green" | "Red" | "Monochrome"
 type BeforeInstallPromptEvent = Event & { prompt: () => Promise<void>; userChoice: Promise<{ outcome: "accepted" | "dismissed" }> }
 
 const paletteOptions: Palette[] = ["All colors", "Blue", "Gold", "Green", "Red", "Monochrome"]
+
+/** A wallpaper must be proven to render before it replaces the hero. */
+const HERO_PRELOAD_MS = 1_500
+const dayIndex = () => Math.floor(Date.now() / 86_400_000) % paintings.length
 
 function hasPalette(colors: string[], palette: Palette) {
   if (palette === "All colors") return true
@@ -41,9 +54,7 @@ function safeExternalUrl(value: string): string | undefined {
 }
 
 function App() {
-  const [active, setActive] = useState<Painting>(() => {
-    return paintings[Math.floor(Date.now() / 86_400_000) % paintings.length]
-  })
+  const [active, setActive] = useState<Painting>(() => paintings[dayIndex()])
   const [search, setSearch] = useState("")
   const [artistFilter, setArtistFilter] = useState("All artists")
   const [styleFilter, setStyleFilter] = useState("All styles")
@@ -64,7 +75,9 @@ function App() {
   const [detail, setDetail] = useState<Painting | null>(null)
   const [downloading, setDownloading] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
-  const [livePainting, setLivePainting] = useState<Painting | null>(null)
+  // Every live result found this session is kept, so the history strip and the gallery
+  // do not lose earlier discoveries the moment a new one arrives.
+  const [livePaintings, setLivePaintings] = useState<Painting[]>([])
   const [liveLoading, setLiveLoading] = useState(false)
   const [liveMode, setLiveMode] = useState<LiveMode>("popular")
   const [imgError, setImgError] = useState(false)
@@ -74,7 +87,12 @@ function App() {
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false)
   const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null)
   const [visibleCount, setVisibleCount] = useState(16)
+  const [activating, setActivating] = useState(false)
+  /** Palettes read back from live images, keyed by painting id. */
+  const [derivedColors, setDerivedColors] = useState<Record<string, string[]>>({})
   const moreRef = useRef<HTMLDivElement>(null)
+  /** Guards against a slow activation overwriting a newer one. */
+  const activationRef = useRef(0)
 
   useEffect(() => { try { localStorage.setItem("mw_favs", JSON.stringify([...favs])) } catch {} }, [favs])
   useEffect(() => { try { localStorage.setItem("mw_history", JSON.stringify(history.slice(0, 30))) } catch {} }, [history])
@@ -96,24 +114,52 @@ function App() {
     })
   }, [active.id])
 
-  // daily auto: if enabled, lock to day Index until next day
+  // Daily wallpaper: deterministic for the day, so every device shows the same work.
   useEffect(() => {
     if (!autoDaily) return
-    const index = Math.floor(Date.now() / 86_400_000) % paintings.length
+    const index = dayIndex()
     try { localStorage.setItem("mw_day_index", String(index)) } catch {}
     setActive(paintings[index])
   }, [autoDaily])
   useEffect(() => { setVisibleCount(16) }, [search, artistFilter, styleFilter, museumFilter, periodFilter, paletteFilter, showFavsOnly, sort])
 
+  // Curated works carry a hand-picked palette; live results arrive with the neutral
+  // placeholder, so read real tones off the thumbnail once. A CORS-enabled load is a
+  // separate request from the display one and may fail — the palette is decorative,
+  // so failure quietly leaves the placeholder in place.
+  useEffect(() => {
+    if (active.colors !== fallbackColors || derivedColors[active.id]) return
+    let cancelled = false
+    preloadImage(active.thumb, 4_000, "anonymous")
+      .then(image => {
+        if (cancelled) return
+        const palette = extractPalette(image)
+        if (palette !== fallbackColors) setDerivedColors(previous => ({ ...previous, [active.id]: palette }))
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [active.id, active.colors, active.thumb, derivedColors])
+
+  // Escape closes the detail dialog, which is the behaviour a modal is expected to have.
+  useEffect(() => {
+    if (!detail) return
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setDetail(null) }
+    window.addEventListener("keydown", onKey)
+    return () => window.removeEventListener("keydown", onKey)
+  }, [detail])
+
+  const catalog = useMemo(() => [...livePaintings, ...paintings], [livePaintings])
+  /** Prefer a palette read from the real image over the neutral placeholder. */
+  const colorsFor = useCallback((p: Painting) => derivedColors[p.id] || p.colors, [derivedColors])
+
   const filtered = useMemo(() => {
-    const catalog = livePainting ? [livePainting, ...paintings] : paintings
     let out = catalog.filter(p => {
       if (showFavsOnly && !favs.has(p.id)) return false
       if (artistFilter !== "All artists" && p.artist !== artistFilter) return false
       if (styleFilter !== "All styles" && p.style !== styleFilter) return false
       if (museumFilter !== "All museums" && p.museum !== museumFilter) return false
       if (periodFilter !== "All periods" && p.period !== periodFilter) return false
-      if (!hasPalette(p.colors, paletteFilter)) return false
+      if (!hasPalette(colorsFor(p), paletteFilter)) return false
       if (search) {
         const q = search.toLowerCase()
         return p.title.toLowerCase().includes(q) || p.artist.toLowerCase().includes(q) || p.style.toLowerCase().includes(q) || p.year.toLowerCase().includes(q) || p.museum.toLowerCase().includes(q) || p.period.toLowerCase().includes(q)
@@ -126,9 +172,12 @@ function App() {
       return rank(a.id) - rank(b.id)
     })
     return out
-  }, [search, artistFilter, styleFilter, museumFilter, periodFilter, paletteFilter, favs, showFavsOnly, sort, randomSeed, livePainting])
+  }, [catalog, colorsFor, search, artistFilter, styleFilter, museumFilter, periodFilter, paletteFilter, favs, showFavsOnly, sort, randomSeed])
 
-  const historyPaintings = useMemo(() => history.map(id => paintings.find(p => p.id === id) || (livePainting?.id === id ? livePainting : null)).filter(Boolean) as Painting[], [history, livePainting])
+  const historyPaintings = useMemo(
+    () => history.map(id => catalog.find(p => p.id === id)).filter(Boolean).slice(0, 10) as Painting[],
+    [history, catalog],
+  )
   const visiblePaintings = filtered.slice(0, visibleCount)
   useEffect(() => {
     const target = moreRef.current
@@ -140,13 +189,58 @@ function App() {
     return () => observer.disconnect()
   }, [filtered.length, visibleCount])
 
+  /**
+   * The single way a wallpaper reaches the hero. The image is decoded first and only
+   * swapped in once it is known to render; a source that fails or exceeds the budget
+   * falls back to curated art, so the hero is never broken.
+   */
+  const activate = useCallback(async (painting: Painting, options: { scroll?: boolean } = {}) => {
+    const token = ++activationRef.current
+    setActivating(true)
+    try {
+      await preloadImage(getResizedUrl(painting, resolution), HERO_PRELOAD_MS)
+      if (token !== activationRef.current) return
+      setActive(painting)
+      setImgError(false)
+    } catch {
+      if (token !== activationRef.current) return
+      const fallback = paintings.filter(p => p.id !== active.id && p.id !== painting.id)
+      const rescue = fallback[Math.floor(Math.random() * fallback.length)]
+      if (rescue) {
+        setActive(rescue)
+        setImgError(false)
+      }
+      setToast(`${painting.title} would not load — showing curated art`)
+    } finally {
+      if (token === activationRef.current) setActivating(false)
+      if (options.scroll) window.scrollTo({ top: 0, behavior: "smooth" })
+    }
+  }, [resolution, active.id])
+
   const randomize = () => {
-    const pool = filtered.length > 1 ? filtered.filter(p => p.id !== active.id) : paintings.filter(p => p.id !== active.id)
+    const pool = (filtered.length > 1 ? filtered : catalog).filter(p => p.id !== active.id)
     const next = pool[Math.floor(Math.random() * pool.length)]
     if (!next) return
-    setActive(next)
-    setImgError(false)
-    window.scrollTo({ top: 0, behavior: "smooth" })
+    void activate(next, { scroll: true })
+  }
+
+  /** One description of the filter set, so the sheet and the desktop bar stay in step. */
+  const mobileFilterFields = [
+    { label: "ARTIST", value: artistFilter, onChange: setArtistFilter, options: ["All artists", ...artists] },
+    { label: "STYLE", value: styleFilter, onChange: setStyleFilter, options: ["All styles", ...styles] },
+    { label: "MUSEUM", value: museumFilter, onChange: setMuseumFilter, options: ["All museums", ...museums] },
+    { label: "PERIOD", value: periodFilter, onChange: setPeriodFilter, options: ["All periods", ...periods] },
+    { label: "PALETTE", value: paletteFilter, onChange: (value: string) => setPaletteFilter(value as Palette), options: paletteOptions },
+  ]
+
+  const clearFilters = () => {
+    setSearch("")
+    setArtistFilter("All artists")
+    setStyleFilter("All styles")
+    setMuseumFilter("All museums")
+    setPeriodFilter("All periods")
+    setPaletteFilter("All colors")
+    setShowFavsOnly(false)
   }
 
   const toggleFav = (id: string) => setFavs(prev => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n })
@@ -159,11 +253,15 @@ function App() {
     try { await navigator.clipboard.writeText(text); setToast("Link copied") } catch { setToast("Copied") }
   }
 
-  const downloadHD = async (p: Painting) => {
+  /**
+   * Save at the selected resolution. A blob download gives the file a real name, but it
+   * needs CORS, so a rejected fetch falls back to opening the image directly.
+   * Returns whether the file actually reached the device.
+   */
+  const downloadHD = async (p: Painting): Promise<boolean> => {
     const url = getResizedUrl(p, resolution)
     try {
       setDownloading(true)
-      // Try blob download (needs CORS). Wikimedia & Met allow it; IIIF may block -> catch
       const res = await fetch(url, { mode: "cors" })
       if (!res.ok) throw new Error(`http ${res.status}`)
       const blob = await res.blob()
@@ -173,33 +271,30 @@ function App() {
       a.download = wallpaperFilename(p, resolution)
       document.body.appendChild(a); a.click(); a.remove(); window.setTimeout(() => URL.revokeObjectURL(objUrl), 1_000)
       setToast("Download started — check downloads")
+      return true
     } catch {
       window.open(url, "_blank", "noopener,noreferrer")
       setToast("Image opened in a new tab — save it from there")
+      return false
     } finally { setDownloading(false) }
   }
 
+  /**
+   * Browsers cannot set an OS wallpaper, so this fetches the image at the chosen size
+   * and then says exactly where the platform's own control lives.
+   */
   const setWallpaper = async (p: Painting) => {
-    try {
-      if (await setNativeWallpaper(getResizedUrl(p, resolution))) {
-        setToast("Wallpaper updated")
-        return
-      }
-      setToast("Download it, then choose “Set as wallpaper” in Photos or system settings")
-    } catch {
-      setToast("Native wallpaper bridge failed; download the image instead")
-    }
+    // Only claim the file is on the device once the download actually succeeded;
+    // the fallback path leaves the image in a new tab instead.
+    if (await downloadHD(p)) setToast(wallpaperInstructions())
   }
 
   const toggleDaily = async (enabled: boolean) => {
     setAutoDaily(enabled)
     if (!enabled) return
-    const index = Math.floor(Date.now() / 86_400_000) % paintings.length
-    setActive(paintings[index])
-    try {
-      localStorage.setItem("mw_day_index", String(index))
-      if ("Notification" in window && Notification.permission === "default") await Notification.requestPermission()
-    } catch {}
+    const index = dayIndex()
+    void activate(paintings[index], { scroll: true })
+    try { localStorage.setItem("mw_day_index", String(index)) } catch {}
   }
 
   const installApp = async () => {
@@ -214,11 +309,9 @@ function App() {
     setLiveLoading(true)
     try {
       const live = await fetchLivePainting(liveMode, [active.id, ...history])
-      setLivePainting(live)
-      setActive(live)
-      setImgError(false)
-      setToast("Live " + liveMode + ": " + live.title + " — " + live.artist)
-      window.scrollTo({ top: 0, behavior: "smooth" })
+      setLivePaintings(previous => previous.some(p => p.id === live.id) ? previous : [live, ...previous])
+      await activate(live, { scroll: true })
+      setToast(`Live ${liveMode}: ${live.title} — ${live.artist}`)
     } catch (error) {
       console.warn("Live artwork fetch failed", error)
       setToast("Live sources are unavailable — showing curated art")
@@ -251,16 +344,42 @@ function App() {
             <button onClick={() => setMobileFiltersOpen(v=>!v)} className="sm:hidden inline-flex px-3 py-2 rounded-full bg-zinc-800 border border-zinc-700 text-white text-sm">Filters</button>
           </div>
         </div>
-        {/* mobile filters dropdown */}
-        {mobileFiltersOpen && (
-          <div className="sm:hidden border-t border-zinc-800 bg-zinc-900 px-4 py-3">
-            <div className="flex gap-2 overflow-auto scrollbar-hide">
-              <button onClick={()=>setShowFavsOnly(v=>!v)} className={`px-3 py-1.5 rounded-full text-xs font-semibold border whitespace-nowrap ${showFavsOnly?"bg-amber-500 text-black":"bg-zinc-800 text-white border-zinc-700"}`}>♥ Favorites</button>
-              <span className="px-3 py-1.5 rounded-full bg-zinc-800 border border-zinc-700 text-xs text-zinc-400 whitespace-nowrap">{filtered.length} items</span>
+      </header>
+
+      {/* Mobile filter sheet — museum, period and palette have no desktop-free route otherwise */}
+      {mobileFiltersOpen && (
+        <div className="sm:hidden fixed inset-0 z-50">
+          <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={()=>setMobileFiltersOpen(false)} />
+          <div role="dialog" aria-modal="true" aria-label="Filter wallpapers" className="absolute inset-x-0 bottom-0 max-h-[85vh] overflow-auto rounded-t-[28px] border-t border-zinc-800 bg-zinc-900 p-5 pb-8">
+            <div className="mx-auto mb-4 h-1.5 w-10 rounded-full bg-zinc-700" />
+            <div className="flex items-center justify-between">
+              <h2 className="font-serif text-xl font-bold">Filters</h2>
+              <button onClick={()=>setMobileFiltersOpen(false)} aria-label="Close filters" className="w-9 h-9 rounded-full bg-zinc-800 border border-zinc-700 grid place-items-center">✕</button>
+            </div>
+            <div className="mt-4 grid gap-3">
+              {mobileFilterFields.map(field => (
+                <label key={field.label} className="grid gap-1.5">
+                  <span className="text-xs font-semibold tracking-widest text-zinc-400">{field.label}</span>
+                  <select value={field.value} onChange={e=>field.onChange(e.target.value)} className="px-3 py-3 rounded-2xl bg-zinc-800 border border-zinc-700 text-sm text-white focus:outline-none focus:ring-2 focus:ring-amber-500/30">
+                    {field.options.map(option => <option key={option}>{option}</option>)}
+                  </select>
+                </label>
+              ))}
+              <label className="grid gap-1.5">
+                <span className="text-xs font-semibold tracking-widest text-zinc-400">SORT</span>
+                <select value={sort} onChange={e=>{ const value = e.target.value as SortMode; setSort(value); if (value === "random") setRandomSeed(Date.now()) }} className="px-3 py-3 rounded-2xl bg-zinc-800 border border-zinc-700 text-sm text-white focus:outline-none">
+                  <option value="popular">Popular</option><option value="latest">Latest</option><option value="random">Random</option>
+                </select>
+              </label>
+              <button onClick={()=>setShowFavsOnly(v=>!v)} aria-pressed={showFavsOnly} className={`py-3 rounded-2xl text-sm font-bold border transition ${showFavsOnly?"bg-amber-500 text-black border-amber-500":"bg-zinc-800 text-white border-zinc-700"}`}>♥ Favorites only ({favs.size})</button>
+            </div>
+            <div className="mt-5 flex gap-3">
+              <button onClick={clearFilters} className="flex-1 py-3 rounded-2xl bg-zinc-800 border border-zinc-700 text-white font-semibold text-sm">Clear all</button>
+              <a href="#gallery" onClick={()=>setMobileFiltersOpen(false)} className="flex-1 py-3 rounded-2xl bg-white text-black text-center font-bold text-sm">Show {filtered.length}</a>
             </div>
           </div>
-        )}
-      </header>
+        </div>
+      )}
 
       {/* Hero */}
       <section className="mx-auto max-w-[1400px] px-4 sm:px-6 pt-5 pb-6">
@@ -269,7 +388,7 @@ function App() {
             <div className="absolute inset-0 bg-gradient-to-t from-black/75 via-black/10 to-transparent z-10 pointer-events-none" />
             {!imgError ? (
               <img key={active.id} src={activeUrl} alt={`${active.title} by ${active.artist}`} className={`w-full h-[500px] sm:h-[620px] lg:h-[700px] object-center transition duration-700 group-hover:scale-[1.02] ${coverMode==="cover"?"object-cover":"object-contain bg-zinc-800"}`} loading="eager"
-                onError={() => { console.warn("hero image failed", activeUrl); setImgError(true); setToast("Image failed — trying another"); const fallback = paintings.find(p => p.id !== active.id); if (fallback) setTimeout(() => { setActive(fallback); setImgError(false) }, 500) }}
+                onError={() => { console.warn("hero image failed", activeUrl); setImgError(true); setToast("Image failed — trying another"); const pool = paintings.filter(p => p.id !== active.id); const rescue = pool[Math.floor(Math.random() * pool.length)]; if (rescue) setTimeout(() => { setActive(rescue); setImgError(false) }, 500) }}
                 onLoad={()=>setImgError(false)} />
             ) : (
               <div className="w-full h-[500px] sm:h-[620px] lg:h-[700px] grid place-items-center bg-zinc-800 text-zinc-400 p-8 text-center">
@@ -279,6 +398,11 @@ function App() {
                   <p className="text-sm mt-1 text-zinc-400">Museum image blocked — falling back…</p>
                   <button onClick={randomize} className="mt-4 px-5 py-2 rounded-full bg-amber-500 text-black font-bold text-sm">Shuffle curated</button>
                 </div>
+              </div>
+            )}
+            {activating && (
+              <div className="absolute inset-x-0 top-0 z-30 h-1 overflow-hidden bg-white/10" role="status" aria-label="Loading wallpaper">
+                <div className="h-full w-1/3 animate-[slide_1.1s_ease-in-out_infinite] bg-amber-400" />
               </div>
             )}
             <div className="absolute top-4 left-4 right-4 z-20 flex items-center justify-between gap-2">
@@ -294,7 +418,7 @@ function App() {
               <div className="flex flex-wrap gap-2 mb-3">
                 <span className="px-2.5 py-1 rounded-full bg-amber-500 text-black text-[11px] font-bold tracking-widest">{autoDaily ? "WALLPAPER OF THE DAY" : "NOW SHOWING"}</span>
                 <span className="px-2.5 py-1 rounded-full bg-zinc-900/80 backdrop-blur border border-white/10 text-white text-xs">{active.museum}</span>
-                {livePainting?.id === active.id && <span className="px-2.5 py-1 rounded-full bg-emerald-500 text-black text-xs font-bold">LIVE API</span>}
+                {livePaintings.some(p => p.id === active.id) && <span className="px-2.5 py-1 rounded-full bg-emerald-500 text-black text-xs font-bold">LIVE API</span>}
               </div>
               <h2 className="font-serif text-[28px] sm:text-4xl lg:text-[42px] leading-none font-bold text-white drop-shadow-xl line-clamp-2">{active.title}</h2>
               <p className="mt-2 text-zinc-200 text-[15px] sm:text-lg"><span className="font-semibold text-white">{active.artist}</span> <span className="text-zinc-400">• {active.year}</span></p>
@@ -306,7 +430,7 @@ function App() {
                 <button onClick={()=>sharePainting(active)} className="inline-flex items-center gap-2 px-4 py-3 rounded-full bg-zinc-800 border border-zinc-700 text-white font-semibold text-sm hover:bg-zinc-700 transition">Share ↗</button>
               </div>
               <div className="mt-3 flex items-center gap-3 text-[11px] tracking-wide text-zinc-400 flex-wrap">
-                <span>Tip: Download → Photos → Share → Use as Wallpaper</span>
+                <span>Tip: {wallpaperInstructions()}</span>
                 <span className="hidden sm:inline">•</span>
                 <button onClick={()=>setCoverMode(m=>m==="cover"?"contain":"cover")} className="underline decoration-zinc-600 underline-offset-2 hover:text-white">View: {coverMode === "cover" ? "Fill (wallpaper)" : "Fit (full painting)"}</button>
               </div>
@@ -327,8 +451,8 @@ function App() {
                 <button onClick={fetchLiveMasterpiece} disabled={liveLoading} className="py-3 rounded-2xl bg-zinc-800 border border-zinc-700 text-white font-semibold text-sm hover:bg-zinc-700 transition disabled:opacity-60">{liveLoading?"Fetching…":`✨ Live ${liveMode}`}</button>
               </div>
               <div className="mt-3 flex items-center gap-2 text-xs text-zinc-500">
-                <span className={`w-2 h-2 rounded-full ${livePainting?"bg-emerald-500 animate-pulse":"bg-zinc-600"}`} />
-                {livePainting ? `Live: ${livePainting.title.slice(0,32)}` : `Curated: ${paintings.length} offline-ready`}
+                <span className={`w-2 h-2 rounded-full ${livePaintings.length?"bg-emerald-500 animate-pulse":"bg-zinc-600"}`} />
+                {livePaintings.length ? `${livePaintings.length} live found — ${livePaintings[0].title.slice(0,28)}` : `Curated: ${paintings.length} offline-ready`}
               </div>
 
               <div className="mt-5">
@@ -349,7 +473,7 @@ function App() {
               <div className="mt-5">
                 <label className="text-xs font-semibold tracking-widest text-zinc-400">PALETTE</label>
                 <div className="mt-2 flex gap-2">
-                  {active.colors.map(c => <div key={c} className="w-8 h-8 rounded-full border border-white/10 shadow" style={{background:c}} title={c} />)}
+                  {colorsFor(active).map(c => <div key={c} className="w-8 h-8 rounded-full border border-white/10 shadow" style={{background:c}} title={c} />)}
                   <span className="ml-2 text-xs text-zinc-500 self-center">Wallpaper tones</span>
                 </div>
               </div>
@@ -359,7 +483,7 @@ function App() {
                   <label className="text-xs font-semibold tracking-widest text-zinc-400">RECENT</label>
                   <div className="mt-2 flex gap-2 overflow-auto scrollbar-hide pb-1">
                     {historyPaintings.slice(0,10).map(p => (
-                      <button key={p.id+"h"} onClick={()=>setActive(p)} className={`shrink-0 w-14 h-14 rounded-xl overflow-hidden border-2 ${active.id===p.id?"border-amber-500":"border-transparent"}`}>
+                      <button key={p.id+"h"} onClick={()=>void activate(p, { scroll: true })} className={`shrink-0 w-14 h-14 rounded-xl overflow-hidden border-2 ${active.id===p.id?"border-amber-500":"border-transparent"}`}>
                         <img src={p.thumb} alt={p.title} className="w-full h-full object-cover" loading="lazy" />
                       </button>
                     ))}
@@ -369,7 +493,7 @@ function App() {
 
               <div className="mt-5 rounded-2xl bg-gradient-to-br from-amber-500/15 to-orange-600/15 border border-amber-500/20 p-4">
                 <p className="text-sm font-bold text-amber-200">📱 Install as app</p>
-                <p className="mt-1 text-xs leading-relaxed text-zinc-300">Mobile: Chrome → ⋮ → Add to Home Screen. Then fullscreen + offline. For native iOS/Android use Capacitor (see README).</p>
+                <p className="mt-1 text-xs leading-relaxed text-zinc-300">Android/desktop: use the install button or the browser menu. iOS: Share → Add to Home Screen. Runs fullscreen and keeps the shell offline.</p>
                 {installPrompt && <button onClick={installApp} className="mt-3 px-4 py-2 rounded-full bg-white text-black text-xs font-bold">Install Masterpiece</button>}
               </div>
             </div>
@@ -431,12 +555,12 @@ function App() {
         {filtered.length===0 ? (
           <div className="py-20 text-center rounded-[24px] bg-zinc-900 border border-zinc-800">
             <p className="text-zinc-400">No matches. Try another artist or clear filters.</p>
-            <button onClick={()=>{setSearch(""); setArtistFilter("All artists"); setStyleFilter("All styles"); setMuseumFilter("All museums"); setPeriodFilter("All periods"); setPaletteFilter("All colors"); setShowFavsOnly(false)}} className="mt-4 px-5 py-2 rounded-full bg-white text-black font-semibold text-sm">Clear filters</button>
+            <button onClick={clearFilters} className="mt-4 px-5 py-2 rounded-full bg-white text-black font-semibold text-sm">Clear filters</button>
           </div>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
             {visiblePaintings.map(p => (
-              <article key={p.id} className={`group relative overflow-hidden rounded-[20px] bg-zinc-900 border transition cursor-pointer flex flex-col [content-visibility:auto] ${active.id===p.id?"border-amber-500/50 ring-2 ring-amber-500/20":"border-zinc-800 hover:border-zinc-700"}`} onClick={()=>setActive(p)}>
+              <article key={p.id} className={`group relative overflow-hidden rounded-[20px] bg-zinc-900 border transition cursor-pointer flex flex-col [content-visibility:auto] ${active.id===p.id?"border-amber-500/50 ring-2 ring-amber-500/20":"border-zinc-800 hover:border-zinc-700"}`} onClick={()=>void activate(p, { scroll: true })}>
                 <div className="relative overflow-hidden">
                   <img src={p.thumb} alt={`${p.title} by ${p.artist}`} loading="lazy" onError={e=>{(e.currentTarget as HTMLImageElement).style.display="none"}} className="w-full h-[260px] object-cover transition duration-500 group-hover:scale-[1.04]" />
                   <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/0 to-transparent opacity-80" />
@@ -445,7 +569,7 @@ function App() {
                   </div>
                   <button onClick={e=>{e.stopPropagation(); toggleFav(p.id)}} aria-label="favorite" className={`absolute top-3 right-3 w-8 h-8 rounded-full grid place-items-center backdrop-blur border text-sm transition ${favs.has(p.id)?"bg-amber-500 border-amber-400 text-black":"bg-black/50 border-white/15 text-white"}`}>{favs.has(p.id)?"♥":"♡"}</button>
                   <div className="absolute bottom-3 left-3 right-3 flex gap-2">
-                    <button onClick={e=>{e.stopPropagation(); setActive(p); void setWallpaper(p)}} className="flex-1 py-2 rounded-full bg-white text-black text-xs font-bold hover:bg-zinc-100 transition">Set wallpaper</button>
+                    <button onClick={e=>{e.stopPropagation(); void activate(p); void setWallpaper(p)}} className="flex-1 py-2 rounded-full bg-white text-black text-xs font-bold hover:bg-zinc-100 transition">Set wallpaper</button>
                     <button onClick={e=>{e.stopPropagation(); setDetail(p)}} className="px-3 py-2 rounded-full bg-black/60 backdrop-blur border border-white/15 text-white text-xs font-semibold">Details</button>
                   </div>
                   {active.id===p.id && <span className="absolute bottom-3 right-3 hidden sm:inline-flex translate-y-[-44px] px-2 py-1 rounded-full bg-amber-500 text-black text-[10px] font-bold tracking-widest">ACTIVE</span>}
@@ -486,7 +610,7 @@ function App() {
                 <p className="mt-2 text-zinc-300"><span className="font-semibold text-white">{detail.artist}</span> • {detail.museum}</p>
                 <p className="mt-1 text-xs text-zinc-500">{detail.license} • {detail.period} • {detail.aspect}</p>
                 <p className="mt-4 text-sm leading-relaxed text-zinc-400">{detail.description}</p>
-                <div className="mt-6 flex flex-wrap gap-2">{detail.colors.map(c=><span key={c} className="w-7 h-7 rounded-full border border-white/10" style={{background:c}} />)}</div>
+                <div className="mt-6 flex flex-wrap gap-2">{colorsFor(detail).map(c=><span key={c} className="w-7 h-7 rounded-full border border-white/10" style={{background:c}} />)}</div>
                 <div className="mt-8 grid gap-3">
                   <button onClick={()=>setWallpaper(detail)} className="w-full py-3.5 rounded-2xl bg-amber-500 text-black font-bold">Set as wallpaper</button>
                   <button onClick={()=>downloadHD(detail)} className="w-full py-3.5 rounded-2xl bg-white text-black font-bold">⬇ Download {resolution.split("(")[0].trim()}</button>

@@ -9,16 +9,9 @@
     "lint": "oxlint",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:watch": "vitest",
-    "cap:copy": "npx cap copy",
-    "cap:open:ios": "npx cap open ios",
-    "cap:open:android": "npx cap open android"
+    "test:watch": "vitest"
   },
   "dependencies": {
-    "@capacitor/android": "^8.5.1",
-    "@capacitor/cli": "^8.5.1",
-    "@capacitor/core": "^8.5.1",
-    "@capacitor/ios": "^8.5.1",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },
@@ -33,7 +26,6 @@
     "jsdom": "^29.1.1",
     "oxlint": "^1.79.0",
     "postcss": "^8.5.28",
-    "sharp": "^0.35.4",
     "tailwindcss": "^3.4.19",
     "typescript": "~6.0.2",
     "vite": "^8.2.2",
