@@ -383,7 +383,10 @@ function App() {
 
       {/* Hero */}
       <section className="mx-auto max-w-[1400px] px-4 sm:px-6 pt-5 pb-6">
-        <div className="grid lg:grid-cols-[1.35fr_0.85fr] gap-5">
+        {/* items-start: the hero card must size to its image. Stretching it to the
+            taller right column left the title and every action button stranded in
+            blank space below the painting, off-screen on a laptop. */}
+        <div className="grid lg:grid-cols-[1.35fr_0.85fr] gap-5 lg:items-start">
           <div className="relative group overflow-hidden rounded-[28px] bg-zinc-900 border border-zinc-800">
             <div className="absolute inset-0 bg-gradient-to-t from-black/75 via-black/10 to-transparent z-10 pointer-events-none" />
             {!imgError ? (
